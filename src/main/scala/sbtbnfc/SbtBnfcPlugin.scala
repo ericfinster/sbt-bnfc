@@ -20,20 +20,20 @@ import sbt._
 import Keys._
 import jflex.Options
 import jflex.Main
+import plugins._
 
 object SbtBnfcPlugin extends AutoPlugin {
 
   object autoImport {
 
     val bnfcCommand = settingKey[String]("The bnfc command")
-    val bnfcSuffix = settingKey[String]("Suffix for bnfc gammar files")
     val bnfcSrcDirectory = settingKey[File]("Directory for bnfc sources")
     val bnfcTgtDirectory = settingKey[File]("Bnfc target directory")
-    val bnfcSources = taskKey[Seq[File]]("The list of sources to process")
     val bnfcBasePackage = taskKey[Option[String]]("Package prepended to generated files")
 
     val bisonCommand = settingKey[String]("The bison command")
     val scalaBisonJar = settingKey[File]("The scala-bison.jar file")
+    val scalaBisonDebug = settingKey[Boolean]("Generate debug information in parser")
 
     val genGrammars = taskKey[Seq[File]]("Generate parser/lexer from bnfc grammar")
 
@@ -41,82 +41,124 @@ object SbtBnfcPlugin extends AutoPlugin {
 
   import autoImport._
 
+  override def requires = JvmPlugin
   override def trigger = allRequirements
 
   override lazy val projectSettings = Seq(
 
     bnfcCommand := "bnfc",
-    bnfcSuffix := ".cf",
     bnfcSrcDirectory := (sourceDirectory in Compile).value / "bnfc",
     bnfcTgtDirectory := (sourceManaged in Compile).value,
     bnfcBasePackage := None,
 
-    bnfcSources := {
-      val srcDir = bnfcSrcDirectory.value
-      val suffix = bnfcSuffix.value
-      (srcDir ** ("*" + suffix)).get
-    },
-
-    scalaBisonJar := unmanagedBase.value / "scala-bison-2.11.jar",
-
     bisonCommand := "bison",
+    scalaBisonDebug := false,
+    scalaBisonJar := baseDirectory.value / "project" / "lib" / "scala-bison-2.11.jar",
 
     genGrammars := {
 
+      val srcDir = bnfcSrcDirectory.value
+      val tgtDir = bnfcTgtDirectory.value
+      val bnfcCmd = bnfcCommand.value
+      val sbJar = scalaBisonJar.value
+      val basePkg = bnfcBasePackage.value
+      val scalaJars = scalaInstance.value.allJars().toSeq
+      val debug = scalaBisonDebug.value
       val log = streams.value.log
-      val sources = bnfcSources.value
-      val cmd = bnfcCommand.value
-      val wd = bnfcSrcDirectory.value
-      val td = bnfcTgtDirectory.value
-      val sbjar = scalaBisonJar.value
-      val sh = scalaHome.value
 
-      val (pkgOpt, outDir) : (List[String], File) =
-        bnfcBasePackage.value match {
-          case None => (List(), td)
-          case Some(pkgName) => (List("-p", pkgName), td / pkgName.replace(".", "/"))
-        }
-
-      for {
-        file <- sources
-      } {
-
-        log.info("Generating source from: " + file.name)
-
-        Process(List(cmd, "--scala", "-o", td.absolutePath) ++ pkgOpt ++ List(file.name), wd) ! log
-
-        log.info("Running bison ...")
-        Process("bison" :: "-v" :: "Parser.y" :: Nil, outDir) ! log
-
-        log.info("Running scala-bison on generated parser ...")
-
-        val forkOpts = ForkOptions(
-          bootJars = sbjar +: scalaInstance.value.allJars().toSeq,
-          workingDirectory = Some(outDir)
-        )
-
-        val forkArgs = Seq("-howtorun:object", "edu.uwm.cs.scalabison.RunGenerator", "-v", "Parser.y")
-
-        Fork.scala(forkOpts, forkArgs)
-
-        log.info("Running jflex-scala to generate the lexer ...")
-
-        Options.emitScala = true
-        Options.setDir(outDir.getPath)
-        Main.generate(outDir / "Lexer.flex")
-
+      val cc = FileFunction.cached(
+        streams.value.cacheDirectory / "bnfc",
+        inStyle = FilesInfo.lastModified,
+        outStyle = FilesInfo.exists
+      ) { (in : Set[File]) =>
+        BnfcGenerator.generateGrammars(
+          srcDir, tgtDir, bnfcCmd, sbJar,
+          basePkg, scalaJars, debug, log
+        ).toSet
       }
 
-      Seq(
-        outDir / "Syntax.scala",
-        outDir / "Lexer.scala",
-        outDir / "ParserParser.scala",
-        outDir / "ParserTokens.scala"
-      )
+      cc((srcDir ** "*.cf").get.toSet).toSeq
+
     },
 
     sourceGenerators in Compile += genGrammars.taskValue
 
   )
+
+  object BnfcGenerator {
+
+    def generateGrammars(
+      srcDir: File, tgtDir: File,
+      bnfcCmd: String, sbJar: File,
+      basePkg: Option[String],
+      scalaJars: Seq[File],
+      debug: Boolean, log: Logger
+    ) : Seq[File] = {
+
+      val sources = (srcDir ** ("*.cf")).get
+
+      val fileLists =
+        for {
+          file <- sources
+        } yield {
+
+          log.info("Generating source from: " + file.name)
+
+          val langName = file.base
+          val bisonFname = langName + ".y"
+          val jflexFname = langName + ".flex"
+
+          val pkgName = (basePkg getOrElse "") + "." + langName.toLowerCase
+          val pkgOpt = if (basePkg.isDefined) List("-p", basePkg.get) else List()
+
+          val outDir = tgtDir / pkgName.replace(".", "/")
+
+          Process(List(bnfcCmd, "--scala", "-o", tgtDir.absolutePath) ++ pkgOpt ++ List(file.name), srcDir) ! log
+
+          log.info("Running bison ...")
+          Process("bison" :: "-v" :: bisonFname :: Nil, outDir) ! log
+
+          log.info("Running scala-bison on generated parser ...")
+
+          val forkOpts = ForkOptions(
+            bootJars = sbJar +: scalaJars,
+            workingDirectory = Some(outDir)
+          )
+
+          val forkArgs =
+            Seq("-howtorun:object", "edu.uwm.cs.scalabison.RunGenerator", "-v") ++
+              (if (debug) Seq("-t") else Seq()) ++
+              Seq(bisonFname)
+
+          Fork.scala(forkOpts, forkArgs)
+
+          val pbaseFile = outDir / (langName + "ParserBase.scala")
+          val pbaseImpl =
+            "package " + pkgName + "\n\n" +
+          "class " + langName + "ParserBase { }"
+
+          IO.write(pbaseFile, pbaseImpl)
+
+          log.info("Running jflex-scala to generate the lexer ...")
+
+          Options.emitScala = true
+          Options.setDir(outDir.getPath)
+          Main.generate(outDir / jflexFname)
+
+          Seq(
+            outDir / (langName + "Syntax.scala"),
+            outDir / (langName + "Lexer.scala"),
+            outDir / (langName + "Parser.scala"),
+            outDir / (langName + "Tokens.scala"),
+            pbaseFile
+          )
+
+        }
+
+      fileLists.flatten
+
+    }
+
+  }
 
 }
