@@ -18,8 +18,8 @@ package sbtbnfc
 
 import sbt._
 import Keys._
-import jflex.Options
-import jflex.Main
+// import jflex.Options
+// import jflex.Main
 import plugins._
 
 object SbtBnfcPlugin extends AutoPlugin {
@@ -29,12 +29,13 @@ object SbtBnfcPlugin extends AutoPlugin {
     val bnfcCommand = settingKey[String]("The bnfc command")
     val bnfcSrcDirectory = settingKey[File]("Directory for bnfc sources")
     val bnfcTgtDirectory = settingKey[File]("Bnfc target directory")
-    val bnfcBasePackage = taskKey[Option[String]]("Package prepended to generated files")
+    val bnfcBasePackage = settingKey[Option[String]]("Package prepended to generated files")
 
     val bisonCommand = settingKey[String]("The bison command")
     val scalaBisonJar = settingKey[File]("The scala-bison.jar file")
     val scalaBisonDebug = settingKey[Boolean]("Generate debug information in parser")
 
+    val jflexScalaJar = settingKey[File]("The jflex-scala.jar file")
     val genGrammars = taskKey[Seq[File]]("Generate parser/lexer from bnfc grammar")
 
   }
@@ -54,6 +55,7 @@ object SbtBnfcPlugin extends AutoPlugin {
     bisonCommand := "bison",
     scalaBisonDebug := false,
     scalaBisonJar := baseDirectory.value / "project" / "lib" / "scala-bison-2.11.jar",
+    jflexScalaJar := baseDirectory.value / "project" / "lib" / "jflex-scala-1.7.0-SNAPSHOT.jar",
 
     genGrammars := {
 
@@ -61,6 +63,7 @@ object SbtBnfcPlugin extends AutoPlugin {
       val tgtDir = bnfcTgtDirectory.value
       val bnfcCmd = bnfcCommand.value
       val sbJar = scalaBisonJar.value
+      val jfJar = jflexScalaJar.value
       val basePkg = bnfcBasePackage.value
       val scalaJars = scalaInstance.value.allJars().toSeq
       val debug = scalaBisonDebug.value
@@ -72,7 +75,7 @@ object SbtBnfcPlugin extends AutoPlugin {
         outStyle = FilesInfo.exists
       ) { (in : Set[File]) =>
         BnfcGenerator.generateGrammars(
-          srcDir, tgtDir, bnfcCmd, sbJar,
+          srcDir, tgtDir, bnfcCmd, sbJar, jfJar,
           basePkg, scalaJars, debug, log
         ).toSet
       }
@@ -89,9 +92,9 @@ object SbtBnfcPlugin extends AutoPlugin {
 
     def generateGrammars(
       srcDir: File, tgtDir: File,
-      bnfcCmd: String, sbJar: File,
+      bnfcCmd: String, sbJar: File, jfJar: File,
       basePkg: Option[String],
-      scalaJars: Seq[File],
+      scalaJars: Seq[File], 
       debug: Boolean, log: Logger
     ) : Seq[File] = {
 
@@ -105,14 +108,20 @@ object SbtBnfcPlugin extends AutoPlugin {
           log.info("Generating source from: " + file.name)
 
           val langName = file.base
-          val bisonFname = langName + ".y"
-          val jflexFname = langName + ".flex"
 
-          val pkgName = (basePkg getOrElse "") + "." + langName.toLowerCase
+          val pkgName = basePkg match {
+            case None => langName.toLowerCase
+            case Some("") => langName.toLowerCase
+            case Some(s) => s + "." + langName.toLowerCase
+          }
           val pkgOpt = if (basePkg.isDefined) List("-p", basePkg.get) else List()
 
           val outDir = tgtDir / pkgName.replace(".", "/")
 
+          val bisonFname = langName + ".y"
+          val jflexFname = langName + ".flex"
+
+          log.info("Running bnfc ...")
           Process(List(bnfcCmd, "--scala", "-o", tgtDir.absolutePath) ++ pkgOpt ++ List(file.name), srcDir) ! log
 
           log.info("Running bison ...")
@@ -127,8 +136,8 @@ object SbtBnfcPlugin extends AutoPlugin {
 
           val forkArgs =
             Seq("-howtorun:object", "edu.uwm.cs.scalabison.RunGenerator", "-v") ++
-              (if (debug) Seq("-t") else Seq()) ++
-              Seq(bisonFname)
+          (if (debug) Seq("-t") else Seq()) ++
+          Seq(bisonFname)
 
           Fork.scala(forkOpts, forkArgs)
 
@@ -141,15 +150,20 @@ object SbtBnfcPlugin extends AutoPlugin {
 
           log.info("Running jflex-scala to generate the lexer ...")
 
-          Options.emitScala = true
-          Options.setDir(outDir.getPath)
-          Main.generate(outDir / jflexFname)
+          val jfForkOpts = ForkOptions(
+            bootJars = Seq(jfJar),
+            workingDirectory = Some(outDir),
+            outputStrategy = Some(LoggedOutput(log))
+          )
+
+          Fork.java(jfForkOpts, Seq("jflex.Main", "--scala", jflexFname))
 
           Seq(
             outDir / (langName + "Syntax.scala"),
             outDir / (langName + "Lexer.scala"),
             outDir / (langName + "Parser.scala"),
             outDir / (langName + "Tokens.scala"),
+            outDir / (langName + "Printer.scala"),
             pbaseFile
           )
 
